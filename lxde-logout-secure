@@ -1,0 +1,53 @@
+#!/bin/bash
+
+LXOUT='/usr/bin/lxde-logout'
+LXOUTOFF="$LXOUT-off"
+LOCKFILE="/var/run/gecos-upgrader.lock"
+FLTCOUNT='/usr/share/gecos-upgrader/counter'
+MAXFAULT='3'
+MSG_TITL='Menú de salida temporalmente bloqueado'
+MSG_TEXT="En este momento se está actualizando el sistema y no se recomienda salir de sesión.\n\n¿Desea que se le muestre el menú de salida de todas formas?"
+
+if [ -f $LOCKFILE ] ; then
+    [ $USERNAME = 'root' -a $SUDO_USER ] && USERNAME=$SUDO_USER
+
+    isInSudoGroup=`id -Gn $USERNAME | grep -c sudo`
+
+    if [ $isInSudoGroup != '1' ] ; then
+        zenity --question \
+            --ok-label 'Esperar' \
+            --cancel-label 'Forzar salida' \
+            --window-icon=question \
+            --width=500 \
+            --title="$MSG_TITL" \
+            --text="$MSG_TEXT"
+        RES=`echo $?`
+
+        if [ $RES = '1' ] ; then
+            BLOCKED='no'
+
+            if [ ! -f $FLTCOUNT ] ; then
+                # error: supposing maximum faults
+                BLOCKED='yes'
+            else
+                COUNT=`cat $FLTCOUNT`
+                [ $COUNT -ge $MAXFAULT ] && BLOCKED='yes'
+            fi
+
+            [ $BLOCKED = 'no' ] && \
+            ( echo `expr $COUNT + 1` > $FLTCOUNT ) && \
+            source $LXOUTOFF &
+        fi
+    else
+        source $LXOUTOFF &
+    fi
+else
+    if [ ! -f $FLTCOUNT ] ; then
+        COUNT=`cat $FLTCOUNT`
+        [ $COUNT -gt '0' ] && ( echo `expr $COUNT - 1` > $FLTCOUNT )
+    fi
+
+    source $LXOUTOFF &
+fi
+
+exit 0

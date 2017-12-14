@@ -1,0 +1,261 @@
+#!/usr/bin/env python
+
+import sys
+import os
+import subprocess
+import getpass
+import pwd, grp
+import re
+import requests
+import time
+import dbus
+
+faults_f                    = '/usr/share/gecos-upgrader/counter'
+semaph_f                    = '/var/run/gecos-upgrader.lock'
+SM_DBUS_SERVICE             = 'org.gnome.SessionManager'
+SM_DBUS_OBJECT_PATH         = '/org/gnome/SessionManager'
+SM_DBUS_CLIENT_PRIVATE_PATH = SM_DBUS_SERVICE + '.ClientPrivate'
+INHIBIT_LOGGIN_OUT          = 1
+INHIBIT_USER_SWITCHING      = 2
+INHIBIT_SUSPENDING          = 4
+INHIBIT_IDLE                = 8
+
+class InformationGatherer(object):
+
+    def get_username(self):
+        res = []
+        users = subprocess.check_output('users').replace('\n', '').split(' ')
+        for user in users:
+            if int(pwd.getpwnam(user).pw_uid) >= 1000:
+                res.append(user)
+        if len(res) > 0: return res[0]
+        else: return False
+
+    def is_privileged_user(self, user=False):
+        return (user in grp.getgrnam('sudo').gr_mem)
+
+    def get_gecos_info(self, arg):
+        res = subprocess.check_output(['/usr/bin/lsb_release', '-d']).replace('\n', '').replace('\t',' ').split(' ')
+        if arg == 'vers':
+            return res[2]
+        else:
+            return len(res) == 4
+
+    def X_is_running(self, disp=False):
+        cmd = "last -p now | grep ' :[0-9]* ' | awk '{print $1 \" \" $3}'"
+        res = subprocess.check_output(cmd, shell=True).strip().replace('\n', ' ').split(' ')
+
+        if disp == 'd':
+            # disp = 'd'   --> return displays
+            return res[1::2]
+        elif disp == 'u':
+            # disp = 'u' --> return users
+            return res[0::2]
+        elif disp == 'x':
+            # disp = False --> return res
+            return len(res) > 1
+
+    def get_runlevel(self, runl):
+        res = subprocess.check_output(['runlevel']).replace('\n', '').split(' ')
+        if runl == 'prev':
+            return res[0]
+        else:
+            return res[1]
+
+    def check_network_conn(self, gecos_version):
+        if gecos_version:
+            host = ('http://%s.gecos.guadalinex.org' % (gecos_version.lower()))
+            path = ('/gecos/dists/%s/Release' % (gecos_version.lower()))
+            url  = host + path
+
+            try:
+                return (requests.get(url).status_code == 200)
+            except:
+                return False
+
+    def check_faults(self):
+        faults_n = 0                                    # current number of faults
+        faults_m = 3                                    # maximum number of faults
+
+        with open(faults_f, 'r') as f:
+            faults_n = f.read().replace('\n', '')
+
+        return int(faults_n) >= int(faults_m)
+
+    def __init__(self, token={}):
+
+        token.update({
+                'loginusername': self.get_username(),
+                'is_admin_user': self.is_privileged_user(self.get_username()),
+                'gecos_version': self.get_gecos_info('vers'),
+                'gecos_is_lite': self.get_gecos_info('lite'),
+                #'runlevel_prev': self.get_runlevel('prev'),
+                'runlevel_curr': self.get_runlevel('curr'),
+                'connect_repos': self.check_network_conn(self.get_gecos_info('vers')),
+                'running_x_org': self.X_is_running('x'),
+                #'user_displays': self.X_is_running('d'),
+                #'user_and_disp': self.X_is_running('u'),
+                'toomuchfaults': self.check_faults()
+                })
+
+class SessionManagerClient(object):
+    def __init__(self):
+        bus = dbus.SessionBus()
+        self.sm_proxy = None
+        self.desktop_autostart_id = os.getenv('DESKTOP_AUTOSTART_ID')
+        self.inhibit_cookie = None
+        self.sm_client_name = 'gecos-upgrader'
+        try:
+            self.sm_proxy = bus.get_object(SM_DBUS_SERVICE, SM_DBUS_OBJECT_PATH)
+        except Exception as err:
+            print "Error: cannot connect to %s"%(str(err))
+            pass
+
+    def inhibit(self):
+        if self.inhibit_cookie != None:
+            return
+        m_inhibit = self.sm_proxy.get_dbus_method('Inhibit', SM_DBUS_SERVICE)
+        toplevel_xid = 0
+        self.inhibit_cookie = m_inhibit(self.sm_client_name, toplevel_xid, 'Actualizando el sistema, por favor, espere...', INHIBIT_LOGGIN_OUT)
+
+    def uninhibit(self):
+        if self.inhibit_cookie == None:
+            return
+        m_uninhibit = self.sm_proxy.get_dbus_method('Uninhibit', SM_DBUS_SERVICE)
+        m_uninhibit(self.inhibit_cookie)
+        self.inhibit_cookie = None
+
+    def isConnected(self):
+        return (self.sm_proxy is not None)
+
+def updateSystem():
+    log  = '/tmp/gecos-auto_updates.log'
+    arg1 = 'update'
+    arg2 = 'autoclean -y'
+    arg3 = 'dist-upgrade -y --assume-yes --force-yes'
+    new_env = dict(os.environ)
+    new_env["DEBCONF_PRIORITY"] = "critical"
+    new_env["DEBCONF_FRONTEND"] = "noninteractive"
+
+    #print("Check log file to get more information: %s" %(log))
+    for cmd in arg1, arg2, arg3:
+        res = True
+        cmd = ('/usr/bin/apt-get' + ' ' + cmd).split(' ')
+
+        f_out = open(log, 'a+')
+        res = subprocess.call(cmd, env=new_env, stdout=f_out)
+        f_out.close()
+
+        if int(res) != 0:
+            sys.exit("Something has happened during system update. Check log\n%s" % (log))
+        else:
+            return True
+
+def active_snitch(act):
+    snitch = '/usr/bin/gecos-snitch-client --set-active'
+    return subprocess.call('%s %s'%(snitch, str(act).lower()), shell=True)
+
+def createFileIfNotExists(path, cont=False):
+    if not os.path.exists(os.path.dirname(path)):
+        os.makedirs(os.path.dirname(path))
+
+    if os.path.exists(path):
+        mode = 'r'
+    else:
+        mode = 'w'
+
+    f = open(path,mode)
+    if mode == 'w':
+        if cont:
+            f.write(cont)
+    f.close()
+
+    return True
+
+def chaging_to_user(user):
+    uid = int(pwd.getpwnam(user).pw_uid)
+    try:
+        os.seteuid(uid)
+    except:
+        print('Couldn\'t change to UID %s'%(uid))
+
+if __name__ == "__main__":
+
+    if not os.geteuid() == 0:
+        sys.exit('Script must be run as root')
+
+    createFileIfNotExists(faults_f, '0')
+    os.chmod(faults_f, 0777)
+    createFileIfNotExists(semaph_f)
+
+    token = {}
+    InformationGatherer(token)
+
+    if not token['connect_repos']:
+        sys.exit("connection problems. Can't reach repos")
+
+    if (not token['running_x_org']):
+        if token['runlevel_curr'] != 0 or token['runlevel_curr'] != 6:
+            if updateSystem():
+                print "cli: updated"
+                sys.exit(None)
+        else:
+            print "shutting down/rebooting computer. Nothing to do here!"
+            sys.exit(None)
+
+    elif (( token['gecos_version'] == 'V3' ) and (token['gecos_is_lite'])):
+        lxde_out_f = '/usr/bin/lxde-logout'
+        lxde_off_f = lxde_out_f + '-off'
+        lxde_sec_f = lxde_out_f + '-secure'
+
+        if os.path.exists(lxde_off_f) and os.stat(lxde_out_f).st_size >= 1000:
+            # probably, a forced shutdown
+            #print 'moving out to sec and off to out'
+            os.rename(lxde_out_f, lxde_sec_f)
+            os.rename(lxde_off_f, lxde_out_f)
+
+        # move files to reach: out to off, sec to out
+        if os.path.exists(lxde_out_f) and os.path.exists(lxde_sec_f) and not os.path.exists(lxde_off_f):
+            #print 'moving out to off and sec to out'
+            os.rename(lxde_out_f, lxde_off_f)
+            os.rename(lxde_sec_f, lxde_out_f)
+
+        active_snitch(True)
+        if not updateSystem():
+            sys.exit('Has been problems updating packages. Please read the logs')
+        else:
+            print 'system updated'
+        active_snitch(False)
+
+        if os.path.exists(lxde_out_f) and not os.path.exists(lxde_sec_f):
+            #print 'going back to normal'
+            os.rename(lxde_out_f, lxde_sec_f)
+            os.rename(lxde_off_f, lxde_out_f)
+
+    elif (( token['gecos_version'] == 'V3' ) and (not token['gecos_is_lite'])):
+
+        dbus_cmd = 'grep -z DBUS_SESSION_BUS_ADDRESS /proc/`pidof cinnamon`/environ | cut -d= -f2-'
+        dbus_add = (subprocess.check_output(dbus_cmd, shell=True)).replace('\n', '').rstrip('\0')
+
+        chaging_to_user(token['loginusername'])
+        os.putenv('DBUS_SESSION_BUS_ADDRESS', dbus_add)
+        sm_client = SessionManagerClient()
+        if sm_client.isConnected():
+            #print "DBUS client has been registered."
+            sm_client.inhibit()
+
+        chaging_to_user('root')
+        active_snitch(True)
+        time.sleep(20)
+        if not updateSystem():
+            sys.exit('Has been problems updating packages. Please read the logs')
+        else:
+            print 'system updated'
+        active_snitch(False)
+
+        chaging_to_user(token['loginusername'])
+        if sm_client.isConnected():
+            sm_client.uninhibit()
+
+        chaging_to_user('root')
+
